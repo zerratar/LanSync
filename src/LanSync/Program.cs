@@ -20,7 +20,6 @@
                     Console.WriteLine("Provided folder does not exist.");
                 }
             }
-
             if (string.IsNullOrEmpty(folder))
             {
                 // Otherwise, prompt for the folder

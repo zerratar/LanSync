@@ -13,21 +13,29 @@ namespace LanSync
 {
     public class LanSyncApp
     {
-        private string _folder;
-        private int _port;
-        private UdpClient _udp;
-        private TcpListener _tcp;
-        private ConcurrentDictionary<string, IPEndPoint> _peers = new();
+        private readonly string _folder;
+        private readonly int _port;
+        private readonly UdpClient _udp;
+        private readonly TcpListener _tcp;
+        private readonly ConcurrentDictionary<string, IPEndPoint> _peers = new();
+        private readonly string _peerFile;
         private FileSystemWatcher _watcher;
-        private string _peerFile => Path.Combine(_folder, ".peers.json");
 
         public LanSyncApp(string folder, int port)
         {
             _folder = folder;
             _port = port;
+
             _udp = new UdpClient(port);
             _udp.EnableBroadcast = true;
             _tcp = new TcpListener(IPAddress.Any, port);
+
+            // Store peers.json in AppData\LanSync
+            var appDataFolder = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "LanSync");
+            Directory.CreateDirectory(appDataFolder);
+            _peerFile = Path.Combine(appDataFolder, "peers.json");
         }
 
         public async Task RunAsync()
@@ -44,70 +52,107 @@ namespace LanSync
             // Start watcher
             _watcher = new FileSystemWatcher(_folder)
             {
-                NotifyFilter = NotifyFilters.FileName | NotifyFilters.Size | NotifyFilters.LastWrite
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.Size | NotifyFilters.LastWrite,
+                IncludeSubdirectories = false,
+                EnableRaisingEvents = true
             };
-            _watcher.Created += (s, e) => OnFileChanged(e.FullPath);
-            _watcher.Changed += (s, e) => OnFileChanged(e.FullPath);
-            _watcher.Renamed += (s, e) => OnFileChanged(e.FullPath);
-            _watcher.EnableRaisingEvents = true;
 
-            Console.WriteLine("LAN Sync running. Press Ctrl+C to exit.");
+            _watcher.Created += async (s, e) => await OnFileChanged(e.FullPath, "Created");
+            _watcher.Changed += async (s, e) => await OnFileChanged(e.FullPath, "Changed");
+            _watcher.Renamed += async (s, e) => await OnFileChanged(e.FullPath, "Renamed");
+
+            Console.WriteLine($"[INFO] Watching folder: {_folder}");
+            Console.WriteLine("[INFO] LAN Sync running. Press Ctrl+C to exit.");
             await Task.Delay(-1);
         }
 
-        private void OnFileChanged(string path)
+        private async Task OnFileChanged(string path, string reason)
         {
-            if (Path.GetFileName(path).StartsWith(".")) return; // Skip dotfiles
-            Console.WriteLine($"Detected change: {path}");
-            NotifyPeers(Path.GetFileName(path));
-        }
+            var fileName = Path.GetFileName(path);
+            if (string.IsNullOrEmpty(fileName) || fileName.StartsWith(".")) return; // Skip dotfiles
+            if (!File.Exists(path)) return; // Sometimes fires for deleted files
 
-        private void NotifyPeers(string fileName)
-        {
+            Console.WriteLine($"[EVENT] File {reason}: {fileName}");
+
+            // Wait a bit to ensure file is not locked/incomplete
+            await Task.Delay(500);
+
             foreach (var peer in _peers.Values)
             {
                 try
                 {
+                    Console.WriteLine($"[LOG] Connecting to peer {peer} to send file: {fileName}");
                     using var client = new TcpClient();
-                    client.Connect(peer.Address, _port);
+                    await client.ConnectAsync(peer.Address, _port);
                     using var stream = client.GetStream();
 
-                    // Send a request to sync the file
-                    var msg = Encoding.UTF8.GetBytes("SYNC:" + fileName + "\n");
-                    stream.Write(msg, 0, msg.Length);
+                    var msg = Encoding.UTF8.GetBytes("SEND:" + fileName + "\n");
+                    await stream.WriteAsync(msg, 0, msg.Length);
+
+                    Console.WriteLine($"[SYNC] Sending {fileName} to {peer}...");
+                    await SendFileAsync(stream, path);
+                    Console.WriteLine($"[SYNC] Done sending {fileName} to {peer}");
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Ignore
+                    Console.WriteLine($"[ERR ] Failed to send file to {peer}: {ex.Message}");
                 }
             }
         }
 
         private void LoadPeers()
         {
-            if (File.Exists(_peerFile))
+            try
             {
-                var data = File.ReadAllText(_peerFile);
-                var peers = JsonSerializer.Deserialize<Dictionary<string, string>>(data);
-                foreach (var p in peers)
-                    _peers[p.Key] = IPEndPoint.Parse(p.Value);
+                if (File.Exists(_peerFile))
+                {
+                    var data = File.ReadAllText(_peerFile);
+                    var peers = JsonSerializer.Deserialize<Dictionary<string, string>>(data);
+                    foreach (var p in peers)
+                    {
+                        _peers[p.Key] = IPEndPoint.Parse(p.Value);
+                    }
+                    Console.WriteLine($"[INFO] Loaded {peers.Count} peers from disk:");
+                    foreach (var p in _peers)
+                        Console.WriteLine($"[INFO]   - {p.Key} => {p.Value}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERR ] Failed to load peers: {ex.Message}");
             }
         }
+
         private void SavePeers()
         {
-            var dict = new Dictionary<string, string>();
-            foreach (var kv in _peers)
-                dict[kv.Key] = kv.Value.ToString();
-            File.WriteAllText(_peerFile, JsonSerializer.Serialize(dict));
+            try
+            {
+                var dict = new Dictionary<string, string>();
+                foreach (var kv in _peers)
+                    dict[kv.Key] = kv.Value.ToString();
+                File.WriteAllText(_peerFile, JsonSerializer.Serialize(dict));
+                Console.WriteLine($"[INFO] Saved peer list to {_peerFile}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERR ] Failed to save peers: {ex.Message}");
+            }
         }
 
         private async Task BroadcastPresence()
         {
             while (true)
             {
-                var msg = Encoding.UTF8.GetBytes($"LAN_SYNC:{GetLocalIPAddress()}:{_port}");
-                await _udp.SendAsync(msg, msg.Length, new IPEndPoint(IPAddress.Broadcast, _port));
-                await Task.Delay(5000);
+                try
+                {
+                    var msg = Encoding.UTF8.GetBytes($"LAN_SYNC:{GetLocalIPAddress()}:{_port}");
+                    await _udp.SendAsync(msg, msg.Length, new IPEndPoint(IPAddress.Broadcast, _port));
+                    await Task.Delay(5000);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[ERR ] BroadcastPresence: {ex.Message}");
+                }
             }
         }
 
@@ -115,22 +160,43 @@ namespace LanSync
         {
             while (true)
             {
-                var result = await _udp.ReceiveAsync();
-                var msg = Encoding.UTF8.GetString(result.Buffer);
-                if (msg.StartsWith("LAN_SYNC:"))
+                try
                 {
-                    var parts = msg.Split(":");
-                    if (parts.Length == 3)
+                    var result = await _udp.ReceiveAsync();
+                    var msg = Encoding.UTF8.GetString(result.Buffer);
+                    if (msg.StartsWith("LAN_SYNC:"))
                     {
-                        var ip = parts[1];
-                        var port = int.Parse(parts[2]);
-                        if (ip != GetLocalIPAddress())
+                        var parts = msg.Split(":");
+                        if (parts.Length == 3)
                         {
-                            var endpoint = new IPEndPoint(IPAddress.Parse(ip), port);
-                            _peers[ip] = endpoint;
-                            SavePeers();
+                            var ip = parts[1];
+                            var port = int.Parse(parts[2]);
+                            var localIp = GetLocalIPAddress();
+                            if (ip != localIp)
+                            {
+                                var endpoint = new IPEndPoint(IPAddress.Parse(ip), port);
+
+                                bool isNewPeer = false;
+                                if (!_peers.ContainsKey(ip))
+                                {
+                                    _peers[ip] = endpoint;
+                                    isNewPeer = true;
+                                    SavePeers();
+                                    Console.WriteLine($"[DISC] Discovered new peer: {ip}:{port}");
+                                }
+
+                                if (!isNewPeer)
+                                {
+                                    // Update endpoint in case peer's port changed
+                                    _peers[ip] = endpoint;
+                                }
+                            }
                         }
                     }
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[ERR ] ReceiveBroadcasts: {ex.Message}");
                 }
             }
         }
@@ -138,97 +204,137 @@ namespace LanSync
         private async Task AcceptIncoming()
         {
             _tcp.Start();
+            Console.WriteLine($"[INFO] TCP server listening on port {_port} for incoming syncs.");
             while (true)
             {
-                var client = await _tcp.AcceptTcpClientAsync();
-                _ = Task.Run(() => HandleClient(client));
+                try
+                {
+                    var client = await _tcp.AcceptTcpClientAsync();
+                    Console.WriteLine($"[CONN] Accepted incoming connection from {client.Client.RemoteEndPoint}");
+                    _ = Task.Run(() => HandleClient(client));
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[ERR ] AcceptIncoming: {ex.Message}");
+                }
             }
         }
 
         private async Task HandleClient(TcpClient client)
         {
-            using var stream = client.GetStream();
-            using var reader = new StreamReader(stream, Encoding.UTF8);
-            string line = await reader.ReadLineAsync();
-            if (line.StartsWith("SYNC:"))
+            try
             {
-                var fileName = line.Substring(5);
-                var filePath = Path.Combine(_folder, fileName);
-                if (File.Exists(filePath))
+                using var stream = client.GetStream();
+                using var reader = new StreamReader(stream, Encoding.UTF8, false, 1024, true);
+                string line = await reader.ReadLineAsync();
+                if (line == null)
                 {
-                    Console.WriteLine($"Peer requested file: {fileName}, sending...");
-                    await SendFileAsync(stream, filePath);
+                    Console.WriteLine("[WARN] Received empty message.");
+                    return;
+                }
+                if (line.StartsWith("SEND:"))
+                {
+                    var fileName = line.Substring(5);
+                    var filePath = Path.Combine(_folder, fileName);
+                    Console.WriteLine($"[RECV] Peer wants to send: {fileName} (writing to {filePath})");
+                    await ReceiveFileAsync(stream, filePath);
+                }
+                else
+                {
+                    Console.WriteLine($"[WARN] Unknown command received: {line}");
                 }
             }
-            else if (line.StartsWith("REQUEST:"))
+            catch (Exception ex)
             {
-                var fileName = line.Substring(8);
-                var filePath = Path.Combine(_folder, fileName);
-                if (File.Exists(filePath))
-                    await SendFileAsync(stream, filePath);
+                Console.WriteLine($"[ERR ] HandleClient: {ex.Message}");
             }
-            else if (line.StartsWith("SEND:"))
+            finally
             {
-                var fileName = line.Substring(5);
-                var filePath = Path.Combine(_folder, fileName);
-                await ReceiveFileAsync(stream, filePath);
+                try { client.Close(); } catch { }
             }
         }
 
         private async Task SendFileAsync(NetworkStream stream, string filePath)
         {
-            var info = new FileInfo(filePath);
-            var hash = ComputeFileHash(filePath);
-
-            var header = Encoding.UTF8.GetBytes($"{info.Name}|{info.Length}|{hash}\n");
-            await stream.WriteAsync(header, 0, header.Length);
-
-            // Send file in chunks
-            using var fileStream = File.OpenRead(filePath);
-            byte[] buffer = new byte[8192];
-            int bytesRead;
-            while ((bytesRead = await fileStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+            try
             {
-                await stream.WriteAsync(buffer, 0, bytesRead);
+                var info = new FileInfo(filePath);
+                var hash = ComputeFileHash(filePath);
+
+                var header = Encoding.UTF8.GetBytes($"{info.Name}|{info.Length}|{hash}\n");
+                await stream.WriteAsync(header, 0, header.Length);
+
+                // Send file in chunks
+                using var fileStream = File.OpenRead(filePath);
+                byte[] buffer = new byte[8192];
+                int bytesRead;
+                long totalSent = 0;
+
+                while ((bytesRead = await fileStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                {
+                    await stream.WriteAsync(buffer, 0, bytesRead);
+                    totalSent += bytesRead;
+                }
+                Console.WriteLine($"[SEND] Finished sending {info.Name} ({totalSent} bytes).");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERR ] SendFileAsync: {ex.Message}");
             }
         }
 
         private async Task ReceiveFileAsync(NetworkStream stream, string filePath)
         {
-            // Read header: filename|length|hash
-            using var reader = new StreamReader(stream, Encoding.UTF8, false, 1024, true);
-            string header = await reader.ReadLineAsync();
-            var parts = header.Split('|');
-            var fileName = parts[0];
-            var fileSize = long.Parse(parts[1]);
-            var expectedHash = parts[2];
-
-            var tmpPath = filePath + ".tmp";
-
-            using var fileStream = File.OpenWrite(tmpPath);
-            byte[] buffer = new byte[8192];
-            int bytesRead;
-            long totalRead = 0;
-
-            while (totalRead < fileSize &&
-                (bytesRead = await stream.ReadAsync(buffer, 0, (int)Math.Min(buffer.Length, fileSize - totalRead))) > 0)
+            try
             {
-                await fileStream.WriteAsync(buffer, 0, bytesRead);
-                totalRead += bytesRead;
+                using var reader = new StreamReader(stream, Encoding.UTF8, false, 1024, true);
+                string header = await reader.ReadLineAsync();
+                if (header == null)
+                {
+                    Console.WriteLine("[ERR ] No header received for file transfer.");
+                    return;
+                }
+                var parts = header.Split('|');
+                if (parts.Length != 3)
+                {
+                    Console.WriteLine($"[ERR ] Invalid file header received: {header}");
+                    return;
+                }
+                var fileName = parts[0];
+                var fileSize = long.Parse(parts[1]);
+                var expectedHash = parts[2];
+
+                var tmpPath = filePath + ".tmp";
+                long totalRead = 0;
+
+                using (var fileStream = File.Open(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                {
+                    byte[] buffer = new byte[8192];
+                    int bytesRead;
+                    while (totalRead < fileSize &&
+                        (bytesRead = await stream.ReadAsync(buffer, 0, (int)Math.Min(buffer.Length, fileSize - totalRead))) > 0)
+                    {
+                        await fileStream.WriteAsync(buffer, 0, bytesRead);
+                        totalRead += bytesRead;
+                    }
+                }
+
+                // Check hash
+                var hash = ComputeFileHash(tmpPath);
+                if (hash == expectedHash)
+                {
+                    File.Move(tmpPath, filePath, true);
+                    Console.WriteLine($"[RECV] Received file {fileName} ({fileSize} bytes), integrity OK.");
+                }
+                else
+                {
+                    File.Delete(tmpPath);
+                    Console.WriteLine($"[ERR ] Hash mismatch for file {fileName} ({fileSize} bytes), file discarded.");
+                }
             }
-            fileStream.Close();
-
-            // Check hash
-            var hash = ComputeFileHash(tmpPath);
-            if (hash == expectedHash)
+            catch (Exception ex)
             {
-                File.Move(tmpPath, filePath, true);
-                Console.WriteLine($"Received file {fileName}, integrity OK.");
-            }
-            else
-            {
-                File.Delete(tmpPath);
-                Console.WriteLine($"Received file {fileName}, but hash mismatch!");
+                Console.WriteLine($"[ERR ] ReceiveFileAsync: {ex.Message}");
             }
         }
 
