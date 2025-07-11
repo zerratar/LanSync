@@ -289,10 +289,12 @@ namespace LanSync
                 var info = new FileInfo(filePath);
                 var hash = ComputeFileHash(filePath);
 
+                Console.WriteLine($"[SEND] SHA256({info.Name}) = {hash}, size={info.Length}");
+                PrintFileHex(filePath);
+
                 var header = Encoding.UTF8.GetBytes($"{info.Name}|{info.Length}|{hash}\n");
                 await stream.WriteAsync(header, 0, header.Length);
 
-                // Send file in chunks
                 using var fileStream = File.OpenRead(filePath);
                 byte[] buffer = new byte[8192];
                 int bytesRead;
@@ -347,8 +349,10 @@ namespace LanSync
                     }
                 }
 
-                // Check hash
                 var hash = ComputeFileHash(tmpPath);
+                Console.WriteLine($"[RECV] SHA256({fileName}) = {hash}, size={fileSize}");
+                PrintFileHex(tmpPath);
+
                 if (hash == expectedHash)
                 {
                     File.Move(tmpPath, filePath, true);
@@ -358,11 +362,26 @@ namespace LanSync
                 {
                     File.Delete(tmpPath);
                     Console.WriteLine($"[ERR ] Hash mismatch for file {fileName} ({fileSize} bytes), file discarded.");
+                    Console.WriteLine($"[ERR ] Expected hash: {expectedHash}");
                 }
             }
             catch (Exception ex)
             {
                 Console.WriteLine($"[ERR ] ReceiveFileAsync: {ex.Message}");
+            }
+        }
+
+        private void PrintFileHex(string path)
+        {
+            try
+            {
+                var bytes = File.ReadAllBytes(path);
+                var hex = BitConverter.ToString(bytes).Replace("-", " ");
+                Console.WriteLine($"[HEX ] {Path.GetFileName(path)}: {hex}");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[HEX ] Could not read {path}: {ex.Message}");
             }
         }
 
