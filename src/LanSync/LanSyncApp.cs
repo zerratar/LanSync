@@ -20,6 +20,7 @@ namespace LanSync
 
         // For suppressing re-syncs (loop prevention)
         private readonly ConcurrentDictionary<string, DateTime> _recentlyReceived = new();
+        private readonly ConcurrentDictionary<string, DateTime> _recentlySynced = new();
 
         public LanSyncApp(string folder, int port)
         {
@@ -90,6 +91,17 @@ namespace LanSync
                 }
             }
 
+            // Prevent infinite sync loop: Ignore if just sent to peer
+            if (_recentlySynced.TryGetValue(path, out var sentAt))
+            {
+                _recentlySynced.TryRemove(path, out _);
+                if ((DateTime.UtcNow - sentAt).TotalSeconds < 2)
+                {
+                    Console.WriteLine($"[SKIP] Not syncing {Path.GetFileName(path)} (just sent to peer).");
+                    return;
+                }
+            }
+
             var fileName = Path.GetFileName(path);
 
             if (!File.Exists(path)) return; // Sometimes fires for deleted files
@@ -121,6 +133,9 @@ namespace LanSync
                     Console.WriteLine($"[SYNC] Sending {fileName} to {peer}...");
                     await SendFileAsync(stream, path);
                     Console.WriteLine($"[SYNC] Done sending {fileName} to {peer}");
+
+                    // Mark as just sent (add after each successful send)
+                    _recentlySynced[path] = DateTime.UtcNow;
                 }
                 catch (Exception ex)
                 {
@@ -406,7 +421,6 @@ namespace LanSync
                 buffer.RemoveAt(buffer.Count - 1);
             return Encoding.UTF8.GetString(buffer.ToArray());
         }
-
         private string GetLocalIPAddress()
         {
             var host = Dns.GetHostEntry(Dns.GetHostName());
