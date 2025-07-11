@@ -317,8 +317,8 @@ namespace LanSync
         {
             try
             {
-                using var reader = new StreamReader(stream, Encoding.UTF8, false, 1024, true);
-                string header = await reader.ReadLineAsync();
+                // Read header line as bytes, not using StreamReader!
+                string header = await ReadLineAsync(stream);
                 if (header == null)
                 {
                     Console.WriteLine("[ERR ] No header received for file transfer.");
@@ -340,10 +340,15 @@ namespace LanSync
                 using (var fileStream = File.Open(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None))
                 {
                     byte[] buffer = new byte[8192];
-                    int bytesRead;
-                    while (totalRead < fileSize &&
-                        (bytesRead = await stream.ReadAsync(buffer, 0, (int)Math.Min(buffer.Length, fileSize - totalRead))) > 0)
+                    while (totalRead < fileSize)
                     {
+                        int bytesToRead = (int)Math.Min(buffer.Length, fileSize - totalRead);
+                        int bytesRead = await stream.ReadAsync(buffer, 0, bytesToRead);
+                        if (bytesRead == 0)
+                        {
+                            // End of stream before expected file size!
+                            break;
+                        }
                         await fileStream.WriteAsync(buffer, 0, bytesRead);
                         totalRead += bytesRead;
                     }
@@ -370,6 +375,25 @@ namespace LanSync
                 Console.WriteLine($"[ERR ] ReceiveFileAsync: {ex.Message}");
             }
         }
+
+        // Helper: Read a line from NetworkStream, ASCII/UTF8, without using StreamReader
+        private async Task<string> ReadLineAsync(NetworkStream stream)
+        {
+            var buffer = new List<byte>();
+            var singleByte = new byte[1];
+            while (true)
+            {
+                int n = await stream.ReadAsync(singleByte, 0, 1);
+                if (n == 0) break; // end of stream
+                if (singleByte[0] == '\n') break;
+                buffer.Add(singleByte[0]);
+            }
+            // Remove trailing '\r' if present
+            if (buffer.Count > 0 && buffer[buffer.Count - 1] == '\r')
+                buffer.RemoveAt(buffer.Count - 1);
+            return Encoding.UTF8.GetString(buffer.ToArray());
+        }
+
 
         private void PrintFileHex(string path)
         {
