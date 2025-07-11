@@ -32,9 +32,21 @@ namespace LanSync
 
         // Connection pooling
         private readonly ConcurrentDictionary<IPEndPoint, SemaphoreSlim> _connectionSemaphores = new();
-        private const int MaxConcurrentConnections = 3;
+
+        // Full sync support
+        private readonly SemaphoreSlim _fullSyncSemaphore = new(1, 1);
+        private volatile bool _initialSyncCompleted = false;
+
+        // Progress tracking
+        private readonly SyncProgress _syncProgress = new();
+
+        // Protocol commands
+        private const string FILE_LIST_REQUEST = "FILE_LIST_REQUEST";
+        private const string FILE_LIST_RESPONSE = "FILE_LIST_RESPONSE";
+        private const string REQUEST_FILE = "REQUEST";
 
         // Configuration constants
+        private const int MaxConcurrentConnections = 3;
         private const int CleanupSeconds = 30;
         private const int SuppressionSeconds = 5;
         private const int FileEventDebounceMs = 1000;
@@ -85,7 +97,8 @@ namespace LanSync
                     Task.Run(() => ReceiveBroadcasts(_shutdownToken.Token)),
                     Task.Run(() => BroadcastPresence(_shutdownToken.Token)),
                     Task.Run(() => AcceptIncoming(_shutdownToken.Token)),
-                    Task.Run(() => PeriodicStateSync(_shutdownToken.Token))
+                    Task.Run(() => PeriodicStateSync(_shutdownToken.Token)),
+                    Task.Run(() => PeriodicFullSync(_shutdownToken.Token))
                 };
 
                 // Start file watcher
@@ -93,6 +106,13 @@ namespace LanSync
 
                 Console.WriteLine($"[INFO] Watching folder (recursive): {_folder}");
                 Console.WriteLine("[INFO] LAN Sync running. Press Ctrl+C to exit.");
+
+                // Perform initial full sync after a short delay
+                _ = Task.Run(async () =>
+                {
+                    await Task.Delay(3000); // Wait for peer discovery
+                    await PerformFullSyncWithPeers();
+                });
 
                 // Wait for shutdown signal
                 await Task.Delay(-1, _shutdownToken.Token);
@@ -104,6 +124,488 @@ namespace LanSync
             finally
             {
                 await Shutdown();
+            }
+        }
+
+        // Progress tracking class
+        private class SyncProgress
+        {
+            private int _totalFiles = 0;
+            private int _processedFiles = 0;
+            private int _successfulFiles = 0;
+            private int _failedFiles = 0;
+            private readonly object _lock = new object();
+
+            public void Reset(int totalFiles)
+            {
+                lock (_lock)
+                {
+                    _totalFiles = totalFiles;
+                    _processedFiles = 0;
+                    _successfulFiles = 0;
+                    _failedFiles = 0;
+                }
+            }
+
+            public void RecordSuccess()
+            {
+                lock (_lock)
+                {
+                    _processedFiles++;
+                    _successfulFiles++;
+                }
+            }
+
+            public void RecordFailure()
+            {
+                lock (_lock)
+                {
+                    _processedFiles++;
+                    _failedFiles++;
+                }
+            }
+
+            public (int total, int processed, int successful, int failed, double percentage) GetStatus()
+            {
+                lock (_lock)
+                {
+                    var percentage = _totalFiles > 0 ? (double)_processedFiles / _totalFiles * 100 : 0;
+                    return (_totalFiles, _processedFiles, _successfulFiles, _failedFiles, percentage);
+                }
+            }
+
+            public bool IsCompleted()
+            {
+                lock (_lock)
+                {
+                    return _processedFiles >= _totalFiles && _totalFiles > 0;
+                }
+            }
+        }
+
+        // Enhanced FileMeta class
+        private class FileMeta
+        {
+            public string Hash { get; set; }
+            public DateTime LastWriteUtc { get; set; }
+            public long Size { get; set; }
+            public string Version { get; set; } = Guid.NewGuid().ToString();
+            public string LastModifiedBy { get; set; }
+        }
+
+        // Full sync implementation
+        public async Task PerformFullSyncWithPeers()
+        {
+            if (!await _fullSyncSemaphore.WaitAsync(1000))
+            {
+                Console.WriteLine("[SYNC] Full sync already in progress, skipping...");
+                return;
+            }
+
+            try
+            {
+                Console.WriteLine("[SYNC] ═══════════════════════════════════════");
+                Console.WriteLine("[SYNC] Starting full synchronization...");
+                Console.WriteLine("[SYNC] ═══════════════════════════════════════");
+
+                // Phase 1: Scan local directory
+                Console.WriteLine("[SYNC] Phase 1: Scanning local directory...");
+                await ScanLocalDirectory();
+
+                if (_peers.Count == 0)
+                {
+                    Console.WriteLine("[SYNC] No peers available for synchronization.");
+                    return;
+                }
+
+                // Phase 2: Request file lists from all peers
+                Console.WriteLine($"[SYNC] Phase 2: Requesting file lists from {_peers.Count} peer(s)...");
+                var peerFileLists = new ConcurrentDictionary<IPEndPoint, Dictionary<string, FileMeta>>();
+
+                var peerTasks = _peers.Values.Select(async peer =>
+                {
+                    try
+                    {
+                        var fileList = await RequestPeerFileList(peer);
+                        if (fileList != null)
+                        {
+                            peerFileLists[peer] = fileList;
+                            Console.WriteLine($"[SYNC] Received {fileList.Count} file entries from {peer}");
+                        }
+                        else
+                        {
+                            Console.WriteLine($"[SYNC] Failed to get file list from {peer}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        Console.WriteLine($"[ERR ] Failed to get file list from {peer}: {ex.Message}");
+                    }
+                });
+
+                await Task.WhenAll(peerTasks);
+
+                // Phase 3: Perform three-way merge
+                Console.WriteLine("[SYNC] Phase 3: Analyzing file differences...");
+                await PerformThreeWaySync(peerFileLists);
+
+                _initialSyncCompleted = true;
+                Console.WriteLine("[SYNC] ═══════════════════════════════════════");
+                Console.WriteLine("[SYNC] Full synchronization completed!");
+                Console.WriteLine("[SYNC] ═══════════════════════════════════════");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERR ] Full sync failed: {ex.Message}");
+            }
+            finally
+            {
+                _fullSyncSemaphore.Release();
+            }
+        }
+
+        private async Task ScanLocalDirectory()
+        {
+            var localFiles = new HashSet<string>();
+            await ScanDirectoryRecursive(_folder, localFiles);
+
+            // Remove deleted files from tracking
+            var trackedFiles = _files.Keys.ToList();
+            var removedCount = 0;
+
+            foreach (var trackedFile in trackedFiles)
+            {
+                if (!localFiles.Contains(trackedFile))
+                {
+                    _files.TryRemove(trackedFile, out _);
+                    removedCount++;
+                }
+            }
+
+            Console.WriteLine($"[SCAN] Found {localFiles.Count} files, removed {removedCount} deleted files from tracking");
+            await SaveFileStatesAsync();
+        }
+
+        private async Task ScanDirectoryRecursive(string directory, HashSet<string> foundFiles)
+        {
+            try
+            {
+                // Process files
+                foreach (var file in Directory.GetFiles(directory))
+                {
+                    if (IsInTmpFolder(file)) continue;
+
+                    var relPath = GetRelativePath(file);
+                    if (relPath == null) continue;
+
+                    foundFiles.Add(relPath);
+
+                    // Check if file changed since last scan
+                    var hash = ComputeFileHash(file);
+                    var lastWrite = File.GetLastWriteTimeUtc(file);
+                    var size = new FileInfo(file).Length;
+
+                    if (!_files.TryGetValue(relPath, out var existing) ||
+                        existing.Hash != hash ||
+                        existing.LastWriteUtc != lastWrite ||
+                        existing.Size != size)
+                    {
+                        _files[relPath] = new FileMeta
+                        {
+                            Hash = hash,
+                            LastWriteUtc = lastWrite,
+                            Size = size,
+                            Version = Guid.NewGuid().ToString(),
+                            LastModifiedBy = GetLocalIPAddress()
+                        };
+                    }
+                }
+
+                // Process subdirectories
+                foreach (var subDir in Directory.GetDirectories(directory))
+                {
+                    if (Path.GetFileName(subDir) != ".tmp")
+                        await ScanDirectoryRecursive(subDir, foundFiles);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERR ] ScanDirectoryRecursive: {ex.Message}");
+            }
+        }
+
+        private async Task<Dictionary<string, FileMeta>> RequestPeerFileList(IPEndPoint peer)
+        {
+            var semaphore = GetOrCreateSemaphore(peer);
+            await semaphore.WaitAsync();
+
+            try
+            {
+                using var client = new TcpClient();
+                client.ReceiveTimeout = 30000;
+                client.SendTimeout = 30000;
+
+                await client.ConnectAsync(peer.Address, _port);
+                using var stream = client.GetStream();
+
+                // Send file list request
+                var msg = Encoding.UTF8.GetBytes($"{FILE_LIST_REQUEST}\n");
+                await stream.WriteAsync(msg, 0, msg.Length);
+
+                // Read response
+                var response = await ReadLineAsync(stream);
+                if (response?.StartsWith(FILE_LIST_RESPONSE) == true)
+                {
+                    var parts = response.Split(':');
+                    if (parts.Length >= 2 && int.TryParse(parts[1], out var jsonLength))
+                    {
+                        var jsonBytes = new byte[jsonLength];
+
+                        int totalRead = 0;
+                        while (totalRead < jsonLength)
+                        {
+                            int bytesRead = await stream.ReadAsync(jsonBytes, totalRead, jsonLength - totalRead);
+                            if (bytesRead == 0) break;
+                            totalRead += bytesRead;
+                        }
+
+                        var json = Encoding.UTF8.GetString(jsonBytes);
+                        return JsonSerializer.Deserialize<Dictionary<string, FileMeta>>(json);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERR ] RequestPeerFileList from {peer}: {ex.Message}");
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+
+            return null;
+        }
+
+        private async Task PerformThreeWaySync(ConcurrentDictionary<IPEndPoint, Dictionary<string, FileMeta>> peerFileLists)
+        {
+            var allFiles = new HashSet<string>();
+
+            // Collect all unique file paths
+            allFiles.UnionWith(_files.Keys);
+            foreach (var peerFiles in peerFileLists.Values)
+                allFiles.UnionWith(peerFiles.Keys);
+
+            if (allFiles.Count == 0)
+            {
+                Console.WriteLine("[SYNC] No files to synchronize.");
+                return;
+            }
+
+            // Initialize progress tracking
+            _syncProgress.Reset(allFiles.Count);
+
+            Console.WriteLine($"[SYNC] Found {allFiles.Count} unique files across all peers");
+            Console.WriteLine("[SYNC] Starting file synchronization...");
+
+            // Progress reporting task
+            var progressTask = Task.Run(async () =>
+            {
+                while (!_syncProgress.IsCompleted() && !_shutdownToken.Token.IsCancellationRequested)
+                {
+                    var (total, processed, successful, failed, percentage) = _syncProgress.GetStatus();
+                    if (total > 0)
+                    {
+                        Console.WriteLine($"[PROGRESS] {processed}/{total} files processed ({percentage:F1}%) - Success: {successful}, Failed: {failed}");
+                    }
+                    await Task.Delay(2000, _shutdownToken.Token);
+                }
+            });
+
+            // Process files with controlled parallelism
+            var semaphore = new SemaphoreSlim(Environment.ProcessorCount);
+            var syncTasks = allFiles.Select(async filePath =>
+            {
+                await semaphore.WaitAsync();
+                try
+                {
+                    await SyncSingleFile(filePath, peerFileLists);
+                }
+                finally
+                {
+                    semaphore.Release();
+                }
+            });
+
+            await Task.WhenAll(syncTasks);
+
+            // Final progress report
+            var (finalTotal, finalProcessed, finalSuccessful, finalFailed, finalPercentage) = _syncProgress.GetStatus();
+            Console.WriteLine($"[SYNC] Synchronization complete: {finalProcessed}/{finalTotal} files processed");
+            Console.WriteLine($"[SYNC] Results: {finalSuccessful} successful, {finalFailed} failed");
+        }
+
+        private async Task SyncSingleFile(string filePath, ConcurrentDictionary<IPEndPoint, Dictionary<string, FileMeta>> peerFileLists)
+        {
+            try
+            {
+                var localFile = _files.TryGetValue(filePath, out var local) ? local : null;
+                var localPath = Path.Combine(_folder, filePath);
+                var localExists = File.Exists(localPath);
+
+                // Find the most recent version across all peers
+                FileMeta mostRecentVersion = localFile;
+                IPEndPoint sourcePeer = null;
+
+                foreach (var (peer, files) in peerFileLists)
+                {
+                    if (files.TryGetValue(filePath, out var peerFile))
+                    {
+                        if (mostRecentVersion == null ||
+                            peerFile.LastWriteUtc > mostRecentVersion.LastWriteUtc ||
+                            (peerFile.LastWriteUtc == mostRecentVersion.LastWriteUtc &&
+                             string.Compare(peerFile.Version, mostRecentVersion.Version, StringComparison.Ordinal) > 0))
+                        {
+                            mostRecentVersion = peerFile;
+                            sourcePeer = peer;
+                        }
+                    }
+                }
+
+                // Determine action needed
+                if (mostRecentVersion == null)
+                {
+                    // File doesn't exist anywhere
+                    _syncProgress.RecordSuccess();
+                    return;
+                }
+
+                if (localFile == null && !localExists)
+                {
+                    // File doesn't exist locally, download from peer
+                    if (sourcePeer != null)
+                    {
+                        await RequestFileFromPeer(sourcePeer, filePath);
+                        Console.WriteLine($"[SYNC] Downloaded missing file: {filePath}");
+                        _syncProgress.RecordSuccess();
+                    }
+                    else
+                    {
+                        _syncProgress.RecordSuccess();
+                    }
+                }
+                else if (localFile != null && localExists)
+                {
+                    // File exists locally, check if we need to update
+                    if (mostRecentVersion.Hash != localFile.Hash)
+                    {
+                        if (sourcePeer != null && mostRecentVersion.LastWriteUtc > localFile.LastWriteUtc)
+                        {
+                            await RequestFileFromPeer(sourcePeer, filePath);
+                            Console.WriteLine($"[SYNC] Updated outdated file: {filePath}");
+                            _syncProgress.RecordSuccess();
+                        }
+                        else if (sourcePeer == null)
+                        {
+                            // We have the most recent version, send to peers
+                            await SyncFileToPeers(filePath, localPath);
+                            Console.WriteLine($"[SYNC] Sent newer file to peers: {filePath}");
+                            _syncProgress.RecordSuccess();
+                        }
+                        else
+                        {
+                            _syncProgress.RecordSuccess();
+                        }
+                    }
+                    else
+                    {
+                        _syncProgress.RecordSuccess();
+                    }
+                }
+                else if (localFile != null && !localExists)
+                {
+                    // File tracked but missing locally
+                    if (sourcePeer != null)
+                    {
+                        await RequestFileFromPeer(sourcePeer, filePath);
+                        Console.WriteLine($"[SYNC] Restored missing file: {filePath}");
+                        _syncProgress.RecordSuccess();
+                    }
+                    else
+                    {
+                        // File doesn't exist anywhere, remove from tracking
+                        _files.TryRemove(filePath, out _);
+                        _syncProgress.RecordSuccess();
+                    }
+                }
+                else
+                {
+                    _syncProgress.RecordSuccess();
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERR ] SyncSingleFile {filePath}: {ex.Message}");
+                _syncProgress.RecordFailure();
+            }
+        }
+
+        private async Task RequestFileFromPeer(IPEndPoint peer, string filePath)
+        {
+            var semaphore = GetOrCreateSemaphore(peer);
+            await semaphore.WaitAsync();
+
+            try
+            {
+                using var client = new TcpClient();
+                client.ReceiveTimeout = 60000;
+                client.SendTimeout = 30000;
+
+                await client.ConnectAsync(peer.Address, _port);
+                using var stream = client.GetStream();
+
+                var msg = Encoding.UTF8.GetBytes($"{REQUEST_FILE}:{filePath}\n");
+                await stream.WriteAsync(msg, 0, msg.Length);
+
+                // Handle the file reception
+                var absPath = Path.Combine(_folder, filePath);
+                await ReceiveFileAsync(stream, absPath, filePath);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERR ] RequestFileFromPeer {filePath} from {peer}: {ex.Message}");
+                throw;
+            }
+            finally
+            {
+                semaphore.Release();
+            }
+        }
+
+        // Periodic full sync task
+        private async Task PeriodicFullSync(CancellationToken cancellationToken)
+        {
+            // Wait for initial sync to complete
+            while (!_initialSyncCompleted && !cancellationToken.IsCancellationRequested)
+            {
+                await Task.Delay(5000, cancellationToken);
+            }
+
+            while (!cancellationToken.IsCancellationRequested)
+            {
+                try
+                {
+                    await Task.Delay(TimeSpan.FromHours(1), cancellationToken); // Full sync every hour
+                    Console.WriteLine("[SYNC] Starting scheduled full synchronization...");
+                    await PerformFullSyncWithPeers();
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[ERR ] PeriodicFullSync: {ex.Message}");
+                }
             }
         }
 
@@ -277,7 +779,9 @@ namespace LanSync
                 {
                     Hash = hash,
                     LastWriteUtc = lastWrite,
-                    Size = fileSize
+                    Size = fileSize,
+                    Version = Guid.NewGuid().ToString(),
+                    LastModifiedBy = GetLocalIPAddress()
                 };
                 await SaveFileStatesAsync();
 
@@ -339,7 +843,9 @@ namespace LanSync
                     {
                         Hash = hash,
                         LastWriteUtc = lastWrite,
-                        Size = fileSize
+                        Size = fileSize,
+                        Version = Guid.NewGuid().ToString(),
+                        LastModifiedBy = GetLocalIPAddress()
                     };
                 }
 
@@ -358,6 +864,8 @@ namespace LanSync
         // Enhanced peer synchronization with retry logic
         private async Task SyncFileToPeers(string relPath, string path)
         {
+            if (_peers.Count == 0) return;
+
             var tasks = _peers.Values.Select(peer => SyncFileToPeer(peer, relPath, path)).ToArray();
             await Task.WhenAll(tasks);
         }
@@ -406,6 +914,8 @@ namespace LanSync
 
         private async Task SyncDeleteToPeers(string relPath)
         {
+            if (_peers.Count == 0) return;
+
             var tasks = _peers.Values.Select(peer => SyncDeleteToPeer(peer, relPath)).ToArray();
             await Task.WhenAll(tasks);
         }
@@ -441,6 +951,8 @@ namespace LanSync
 
         private async Task SyncRenameToPeers(string oldRel, string newRel)
         {
+            if (_peers.Count == 0) return;
+
             var tasks = _peers.Values.Select(peer => SyncRenameToPeer(peer, oldRel, newRel)).ToArray();
             await Task.WhenAll(tasks);
         }
@@ -527,6 +1039,13 @@ namespace LanSync
                                     _connectionSemaphores[endpoint] = new SemaphoreSlim(MaxConcurrentConnections);
                                     await SavePeersAsync();
                                     Console.WriteLine($"[DISC] Discovered new peer: {ip}:{port}");
+
+                                    // Trigger full sync when new peer is discovered
+                                    _ = Task.Run(async () =>
+                                    {
+                                        await Task.Delay(2000); // Small delay to let peer stabilize
+                                        await PerformFullSyncWithPeers();
+                                    });
                                 }
                             }
                         }
@@ -601,6 +1120,15 @@ namespace LanSync
                         await HandleRemoteRename(parts[0], parts[1]);
                     }
                 }
+                else if (line.StartsWith(FILE_LIST_REQUEST))
+                {
+                    await HandleFileListRequest(stream);
+                }
+                else if (line.StartsWith($"{REQUEST_FILE}:"))
+                {
+                    var relPath = line.Substring(REQUEST_FILE.Length + 1);
+                    await HandleFileRequest(stream, relPath);
+                }
             }
             catch (Exception ex)
             {
@@ -609,6 +1137,47 @@ namespace LanSync
             finally
             {
                 try { client.Close(); } catch { }
+            }
+        }
+
+        private async Task HandleFileListRequest(NetworkStream stream)
+        {
+            try
+            {
+                var fileList = _files.ToDictionary(x => x.Key, x => x.Value);
+                var json = JsonSerializer.Serialize(fileList);
+                var jsonBytes = Encoding.UTF8.GetBytes(json);
+
+                var response = Encoding.UTF8.GetBytes($"{FILE_LIST_RESPONSE}:{jsonBytes.Length}\n");
+                await stream.WriteAsync(response, 0, response.Length);
+                await stream.WriteAsync(jsonBytes, 0, jsonBytes.Length);
+
+                Console.WriteLine($"[RESP] Sent file list with {fileList.Count} entries");
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERR ] HandleFileListRequest: {ex.Message}");
+            }
+        }
+
+        private async Task HandleFileRequest(NetworkStream stream, string relPath)
+        {
+            try
+            {
+                var absPath = Path.Combine(_folder, relPath);
+                if (File.Exists(absPath) && !IsInTmpFolder(absPath))
+                {
+                    await SendFileAsync(stream, absPath);
+                    Console.WriteLine($"[SEND] Sent requested file: {relPath}");
+                }
+                else
+                {
+                    Console.WriteLine($"[WARN] Requested file not found: {relPath}");
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERR ] HandleFileRequest: {ex.Message}");
             }
         }
 
@@ -663,7 +1232,9 @@ namespace LanSync
                         {
                             Hash = hash,
                             LastWriteUtc = lastWrite,
-                            Size = fileSize
+                            Size = fileSize,
+                            Version = Guid.NewGuid().ToString(),
+                            LastModifiedBy = GetLocalIPAddress()
                         };
                     }
                 }
@@ -680,7 +1251,7 @@ namespace LanSync
             }
         }
 
-        // Enhanced file operations with better error handling
+        // Enhanced file operations with better error handling and progress
         private async Task SendFileAsync(NetworkStream stream, string path)
         {
             try
@@ -691,7 +1262,22 @@ namespace LanSync
                 await stream.WriteAsync(header, 0, header.Length);
 
                 using var fileStream = File.OpenRead(path);
-                await fileStream.CopyToAsync(stream);
+                var buffer = new byte[64 * 1024]; // 64KB chunks
+                long totalSent = 0;
+                int bytesRead;
+
+                while ((bytesRead = await fileStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
+                {
+                    await stream.WriteAsync(buffer, 0, bytesRead);
+                    totalSent += bytesRead;
+
+                    // Progress reporting for large files
+                    if (info.Length > 1024 * 1024 && totalSent % (256 * 1024) == 0) // Report every 256KB for files > 1MB
+                    {
+                        var percentage = (double)totalSent / info.Length * 100;
+                        Console.WriteLine($"[SEND] {Path.GetFileName(path)}: {percentage:F1}% ({totalSent}/{info.Length} bytes)");
+                    }
+                }
             }
             catch (Exception ex)
             {
@@ -728,7 +1314,7 @@ namespace LanSync
 
                 using (var fileStream = File.Create(tmpPath))
                 {
-                    var buffer = new byte[8192];
+                    var buffer = new byte[64 * 1024]; // 64KB chunks
                     long totalRead = 0;
 
                     while (totalRead < fileSize)
@@ -739,6 +1325,13 @@ namespace LanSync
 
                         await fileStream.WriteAsync(buffer, 0, bytesRead);
                         totalRead += bytesRead;
+
+                        // Progress reporting for large files
+                        if (fileSize > 1024 * 1024 && totalRead % (256 * 1024) == 0) // Report every 256KB for files > 1MB
+                        {
+                            var percentage = (double)totalRead / fileSize * 100;
+                            Console.WriteLine($"[RECV] {fileName}: {percentage:F1}% ({totalRead}/{fileSize} bytes)");
+                        }
                     }
                 }
 
@@ -754,7 +1347,9 @@ namespace LanSync
                     {
                         Hash = hash,
                         LastWriteUtc = File.GetLastWriteTimeUtc(absPath),
-                        Size = fileSize
+                        Size = fileSize,
+                        Version = Guid.NewGuid().ToString(),
+                        LastModifiedBy = "peer" // Could be enhanced to track specific peer
                     };
                     await SaveFileStatesAsync();
 
@@ -907,6 +1502,7 @@ namespace LanSync
                 foreach (var semaphore in _connectionSemaphores.Values)
                     semaphore.Dispose();
 
+                _fullSyncSemaphore?.Dispose();
                 _shutdownToken.Dispose();
 
                 Console.WriteLine("[INFO] Shutdown complete.");
@@ -922,7 +1518,7 @@ namespace LanSync
             _shutdownToken.Cancel();
         }
 
-        // Existing utility methods (unchanged)
+        // Utility methods
         private bool IsInTmpFolder(string path)
         {
             var fullTmp = Path.GetFullPath(_tmpFolder) + Path.DirectorySeparatorChar;
@@ -948,11 +1544,14 @@ namespace LanSync
                 {
                     var data = File.ReadAllText(_peerFile);
                     var peers = JsonSerializer.Deserialize<Dictionary<string, string>>(data);
-                    foreach (var p in peers)
-                        _peers[p.Key] = IPEndPoint.Parse(p.Value);
-                    Console.WriteLine($"[INFO] Loaded {peers.Count} peers from disk:");
-                    foreach (var p in _peers)
-                        Console.WriteLine($"[INFO]   - {p.Key} => {p.Value}");
+                    if (peers != null)
+                    {
+                        foreach (var p in peers)
+                            _peers[p.Key] = IPEndPoint.Parse(p.Value);
+                        Console.WriteLine($"[INFO] Loaded {peers.Count} peers from disk:");
+                        foreach (var p in _peers)
+                            Console.WriteLine($"[INFO]   - {p.Key} => {p.Value}");
+                    }
                 }
             }
             catch (Exception ex)
@@ -982,8 +1581,11 @@ namespace LanSync
                     var data = File.ReadAllText(_stateFile);
                     var dic = JsonSerializer.Deserialize<Dictionary<string, FileMeta>>(data);
                     if (dic != null)
+                    {
                         foreach (var kv in dic)
                             _files[kv.Key] = kv.Value;
+                        Console.WriteLine($"[INFO] Loaded {dic.Count} file states from disk");
+                    }
                 }
             }
             catch (Exception ex)
@@ -1036,13 +1638,6 @@ namespace LanSync
                     return ip.ToString();
             }
             throw new Exception("No network adapters with an IPv4 address in the system!");
-        }
-
-        private class FileMeta
-        {
-            public string Hash { get; set; }
-            public DateTime LastWriteUtc { get; set; }
-            public long Size { get; set; }
         }
     }
 }
