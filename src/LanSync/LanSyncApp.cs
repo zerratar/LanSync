@@ -1,13 +1,9 @@
-﻿using System;
-using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Linq;
+﻿using System.Collections.Concurrent;
 using System.Net;
 using System.Net.Sockets;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Threading.Tasks;
 
 namespace LanSync
 {
@@ -19,6 +15,7 @@ namespace LanSync
         private readonly TcpListener _tcp;
         private readonly ConcurrentDictionary<string, IPEndPoint> _peers = new();
         private readonly string _peerFile;
+        private readonly string _tmpFolder;
         private FileSystemWatcher _watcher;
 
         public LanSyncApp(string folder, int port)
@@ -36,6 +33,10 @@ namespace LanSync
                 "LanSync");
             Directory.CreateDirectory(appDataFolder);
             _peerFile = Path.Combine(appDataFolder, "peers.json");
+
+            // Create tmp folder in sync root
+            _tmpFolder = Path.Combine(_folder, ".tmp");
+            Directory.CreateDirectory(_tmpFolder);
         }
 
         public async Task RunAsync()
@@ -68,14 +69,27 @@ namespace LanSync
 
         private async Task OnFileChanged(string path, string reason)
         {
+            // Ignore if in .tmp folder
+            if (IsInTmpFolder(path))
+            {
+                Console.WriteLine($"[SKIP] Ignoring file in temp folder: {path}");
+                return;
+            }
             var fileName = Path.GetFileName(path);
-            if (string.IsNullOrEmpty(fileName) || fileName.StartsWith(".")) return; // Skip dotfiles
+
             if (!File.Exists(path)) return; // Sometimes fires for deleted files
 
             Console.WriteLine($"[EVENT] File {reason}: {fileName}");
 
             // Wait a bit to ensure file is not locked/incomplete
             await Task.Delay(500);
+
+            // Check again for existence (could have been deleted in the meantime)
+            if (!File.Exists(path))
+            {
+                Console.WriteLine($"[SKIP] File disappeared after delay: {fileName}");
+                return;
+            }
 
             foreach (var peer in _peers.Values)
             {
@@ -98,6 +112,14 @@ namespace LanSync
                     Console.WriteLine($"[ERR ] Failed to send file to {peer}: {ex.Message}");
                 }
             }
+        }
+
+        private bool IsInTmpFolder(string path)
+        {
+            // Must be direct child of .tmp folder (not just containing ".tmp" in path)
+            var fullTmp = Path.GetFullPath(_tmpFolder) + Path.DirectorySeparatorChar;
+            var fullPath = Path.GetFullPath(path);
+            return fullPath.StartsWith(fullTmp, StringComparison.OrdinalIgnoreCase);
         }
 
         private void LoadPeers()
@@ -236,6 +258,12 @@ namespace LanSync
                 {
                     var fileName = line.Substring(5);
                     var filePath = Path.Combine(_folder, fileName);
+                    // Never write received files into .tmp location
+                    if (IsInTmpFolder(filePath))
+                    {
+                        Console.WriteLine($"[SKIP] Ignoring incoming file (in .tmp): {fileName}");
+                        return;
+                    }
                     Console.WriteLine($"[RECV] Peer wants to send: {fileName} (writing to {filePath})");
                     await ReceiveFileAsync(stream, filePath);
                 }
@@ -304,7 +332,7 @@ namespace LanSync
                 var fileSize = long.Parse(parts[1]);
                 var expectedHash = parts[2];
 
-                var tmpPath = filePath + ".tmp";
+                var tmpPath = Path.Combine(_tmpFolder, $"{Guid.NewGuid()}.tmp");
                 long totalRead = 0;
 
                 using (var fileStream = File.Open(tmpPath, FileMode.Create, FileAccess.Write, FileShare.None))
@@ -357,5 +385,6 @@ namespace LanSync
             throw new Exception("No network adapters with an IPv4 address in the system!");
         }
     }
+
 
 }
