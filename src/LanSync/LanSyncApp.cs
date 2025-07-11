@@ -18,6 +18,9 @@ namespace LanSync
         private readonly string _tmpFolder;
         private FileSystemWatcher _watcher;
 
+        // For suppressing re-syncs (loop prevention)
+        private readonly ConcurrentDictionary<string, DateTime> _recentlyReceived = new();
+
         public LanSyncApp(string folder, int port)
         {
             _folder = folder;
@@ -75,6 +78,18 @@ namespace LanSync
                 Console.WriteLine($"[SKIP] Ignoring file in temp folder: {path}");
                 return;
             }
+
+            // Prevent infinite sync loop: Ignore if just received via sync
+            if (_recentlyReceived.TryGetValue(path, out var receivedAt))
+            {
+                _recentlyReceived.TryRemove(path, out _);
+                if ((DateTime.UtcNow - receivedAt).TotalSeconds < 2)
+                {
+                    Console.WriteLine($"[SKIP] Not syncing {Path.GetFileName(path)} (just received from peer).");
+                    return;
+                }
+            }
+
             var fileName = Path.GetFileName(path);
 
             if (!File.Exists(path)) return; // Sometimes fires for deleted files
@@ -116,7 +131,6 @@ namespace LanSync
 
         private bool IsInTmpFolder(string path)
         {
-            // Must be direct child of .tmp folder (not just containing ".tmp" in path)
             var fullTmp = Path.GetFullPath(_tmpFolder) + Path.DirectorySeparatorChar;
             var fullPath = Path.GetFullPath(path);
             return fullPath.StartsWith(fullTmp, StringComparison.OrdinalIgnoreCase);
@@ -247,8 +261,7 @@ namespace LanSync
             try
             {
                 using var stream = client.GetStream();
-                using var reader = new StreamReader(stream, Encoding.UTF8, false, 1024, true);
-                string line = await reader.ReadLineAsync();
+                string line = await ReadLineAsync(stream);
                 if (line == null)
                 {
                     Console.WriteLine("[WARN] Received empty message.");
@@ -258,7 +271,6 @@ namespace LanSync
                 {
                     var fileName = line.Substring(5);
                     var filePath = Path.Combine(_folder, fileName);
-                    // Never write received files into .tmp location
                     if (IsInTmpFolder(filePath))
                     {
                         Console.WriteLine($"[SKIP] Ignoring incoming file (in .tmp): {fileName}");
@@ -289,9 +301,6 @@ namespace LanSync
                 var info = new FileInfo(filePath);
                 var hash = ComputeFileHash(filePath);
 
-                Console.WriteLine($"[SEND] SHA256({info.Name}) = {hash}, size={info.Length}");
-                PrintFileHex(filePath);
-
                 var header = Encoding.UTF8.GetBytes($"{info.Name}|{info.Length}|{hash}\n");
                 await stream.WriteAsync(header, 0, header.Length);
 
@@ -317,7 +326,6 @@ namespace LanSync
         {
             try
             {
-                // Read header line as bytes, not using StreamReader!
                 string header = await ReadLineAsync(stream);
                 if (header == null)
                 {
@@ -346,7 +354,6 @@ namespace LanSync
                         int bytesRead = await stream.ReadAsync(buffer, 0, bytesToRead);
                         if (bytesRead == 0)
                         {
-                            // End of stream before expected file size!
                             break;
                         }
                         await fileStream.WriteAsync(buffer, 0, bytesRead);
@@ -355,12 +362,10 @@ namespace LanSync
                 }
 
                 var hash = ComputeFileHash(tmpPath);
-                Console.WriteLine($"[RECV] SHA256({fileName}) = {hash}, size={fileSize}");
-                PrintFileHex(tmpPath);
-
                 if (hash == expectedHash)
                 {
                     File.Move(tmpPath, filePath, true);
+                    _recentlyReceived[filePath] = DateTime.UtcNow;  // Suppress resync
                     Console.WriteLine($"[RECV] Received file {fileName} ({fileSize} bytes), integrity OK.");
                 }
                 else
@@ -374,6 +379,14 @@ namespace LanSync
             {
                 Console.WriteLine($"[ERR ] ReceiveFileAsync: {ex.Message}");
             }
+        }
+
+        private string ComputeFileHash(string file)
+        {
+            using var sha = SHA256.Create();
+            using var fs = File.OpenRead(file);
+            var hash = sha.ComputeHash(fs);
+            return Convert.ToHexString(hash);
         }
 
         // Helper: Read a line from NetworkStream, ASCII/UTF8, without using StreamReader
@@ -394,29 +407,6 @@ namespace LanSync
             return Encoding.UTF8.GetString(buffer.ToArray());
         }
 
-
-        private void PrintFileHex(string path)
-        {
-            try
-            {
-                var bytes = File.ReadAllBytes(path);
-                var hex = BitConverter.ToString(bytes).Replace("-", " ");
-                Console.WriteLine($"[HEX ] {Path.GetFileName(path)}: {hex}");
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[HEX ] Could not read {path}: {ex.Message}");
-            }
-        }
-
-        private string ComputeFileHash(string file)
-        {
-            using var sha = SHA256.Create();
-            using var fs = File.OpenRead(file);
-            var hash = sha.ComputeHash(fs);
-            return Convert.ToHexString(hash);
-        }
-
         private string GetLocalIPAddress()
         {
             var host = Dns.GetHostEntry(Dns.GetHostName());
@@ -428,6 +418,5 @@ namespace LanSync
             throw new Exception("No network adapters with an IPv4 address in the system!");
         }
     }
-
 
 }
