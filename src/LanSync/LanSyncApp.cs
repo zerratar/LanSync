@@ -27,8 +27,11 @@ namespace LanSync
         // File state tracking with conflict resolution
         private readonly ConcurrentDictionary<string, FileMeta> _files = new();
 
-        // Debouncing for file events
-        private readonly ConcurrentDictionary<string, CancellationTokenSource> _pendingFileEvents = new();
+        // Enhanced batching system - replaces simple debouncing
+        private readonly ConcurrentDictionary<string, PendingFileOperation> _pendingFileOperations = new();
+        private readonly Timer _batchProcessingTimer;
+        private DateTime _lastFileActivity = DateTime.UtcNow;
+        private readonly SemaphoreSlim _batchProcessingSemaphore = new(1, 1);
 
         // Connection pooling
         private readonly ConcurrentDictionary<IPEndPoint, SemaphoreSlim> _connectionSemaphores = new();
@@ -40,6 +43,9 @@ namespace LanSync
         // Progress tracking
         private readonly SyncProgress _syncProgress = new();
 
+        // State file access synchronization
+        private readonly SemaphoreSlim _stateFileSemaphore = new(1, 1);
+
         // Protocol commands
         private const string FILE_LIST_REQUEST = "FILE_LIST_REQUEST";
         private const string FILE_LIST_RESPONSE = "FILE_LIST_RESPONSE";
@@ -49,13 +55,25 @@ namespace LanSync
         private const int MaxConcurrentConnections = 3;
         private const int CleanupSeconds = 30;
         private const int SuppressionSeconds = 5;
-        private const int FileEventDebounceMs = 1000;
+        private const int FileEventDebounceMs = 200; // Reduced for individual file debouncing
+        private const int BatchQuietPeriodMs = 3000; // Configurable quiet period (3 seconds)
+        private const int BatchProcessingIntervalMs = 500; // Check for batches every 500ms
         private const int FileStabilitySleepMs = 500;
         private const int MaxRetryAttempts = 3;
         private const int RetryDelayMs = 1000;
 
         // Shutdown coordination
         private readonly CancellationTokenSource _shutdownToken = new();
+
+        // Enhanced pending operation tracking
+        private class PendingFileOperation
+        {
+            public string FilePath { get; set; }
+            public string OperationType { get; set; } // "Changed", "Created", "Deleted", "Renamed"
+            public DateTime LastActivity { get; set; }
+            public string OldPath { get; set; } // For rename operations
+            public bool IsProcessed { get; set; }
+        }
 
         public LanSyncApp(string folder, int port)
         {
@@ -75,6 +93,11 @@ namespace LanSync
 
             _tmpFolder = Path.Combine(_folder, ".tmp");
             Directory.CreateDirectory(_tmpFolder);
+
+            // Initialize batch processing timer
+            _batchProcessingTimer = new Timer(async (obj) => await ProcessPendingBatch(obj), null,
+                TimeSpan.FromMilliseconds(BatchProcessingIntervalMs),
+                TimeSpan.FromMilliseconds(BatchProcessingIntervalMs));
         }
 
         public async Task RunAsync()
@@ -105,6 +128,7 @@ namespace LanSync
                 StartFileWatcher();
 
                 Console.WriteLine($"[INFO] Watching folder (recursive): {_folder}");
+                Console.WriteLine($"[INFO] Batch processing: {BatchQuietPeriodMs}ms quiet period, {BatchProcessingIntervalMs}ms check interval");
                 Console.WriteLine("[INFO] LAN Sync running. Press Ctrl+C to exit.");
 
                 // Perform initial full sync after a short delay
@@ -124,6 +148,359 @@ namespace LanSync
             finally
             {
                 await Shutdown();
+            }
+        }
+
+        // Enhanced batch processing system
+        private async Task ProcessPendingBatch(object state)
+        {
+            if (_shutdownToken.Token.IsCancellationRequested) return;
+
+            try
+            {
+                var now = DateTime.UtcNow;
+                var quietPeriodElapsed = (now - _lastFileActivity).TotalMilliseconds >= BatchQuietPeriodMs;
+
+                if (!quietPeriodElapsed || _pendingFileOperations.IsEmpty)
+                    return;
+
+                // Check if we can acquire the semaphore without blocking
+                if (!await _batchProcessingSemaphore.WaitAsync(10))
+                    return;
+
+                try
+                {
+                    var pendingOperations = _pendingFileOperations.Values
+                        .Where(op => !op.IsProcessed && (now - op.LastActivity).TotalMilliseconds >= BatchQuietPeriodMs)
+                        .OrderBy(op => op.LastActivity)
+                        .ToList();
+
+                    if (pendingOperations.Count == 0)
+                        return;
+
+                    Console.WriteLine($"[BATCH] Processing {pendingOperations.Count} pending file operations after quiet period");
+
+                    // Mark operations as being processed
+                    foreach (var op in pendingOperations)
+                        op.IsProcessed = true;
+
+                    // Group operations by type for efficient processing
+                    var changes = pendingOperations.Where(op => op.OperationType == "Changed" || op.OperationType == "Created").ToList();
+                    var deletions = pendingOperations.Where(op => op.OperationType == "Deleted").ToList();
+                    var renames = pendingOperations.Where(op => op.OperationType == "Renamed").ToList();
+
+                    // Process different operation types
+                    await ProcessBatchedChanges(changes);
+                    await ProcessBatchedDeletions(deletions);
+                    await ProcessBatchedRenames(renames);
+
+                    // Clean up processed operations
+                    foreach (var op in pendingOperations)
+                    {
+                        _pendingFileOperations.TryRemove(op.FilePath, out _);
+                    }
+
+                    // Save state once after processing the entire batch
+                    await SaveFileStatesAsync();
+
+                    Console.WriteLine($"[BATCH] Completed processing {pendingOperations.Count} operations");
+                }
+                finally
+                {
+                    _batchProcessingSemaphore.Release();
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERR ] ProcessPendingBatch: {ex.Message}");
+            }
+        }
+
+        private async Task ProcessBatchedChanges(List<PendingFileOperation> changes)
+        {
+            if (changes.Count == 0) return;
+
+            Console.WriteLine($"[BATCH] Processing {changes.Count} file changes/creations");
+
+            var validChanges = new List<(string relPath, string fullPath, FileMeta meta)>();
+
+            // First pass: validate files and compute metadata
+            foreach (var change in changes)
+            {
+                try
+                {
+                    var relPath = GetRelativePath(change.FilePath);
+                    if (relPath == null || IsInTmpFolder(change.FilePath) || !File.Exists(change.FilePath))
+                        continue;
+
+                    if (IsRecentlyProcessed(relPath))
+                    {
+                        Console.WriteLine($"[SKIP] Not syncing {relPath} (recently processed).");
+                        continue;
+                    }
+
+                    if (!await WaitForFileStability(change.FilePath))
+                    {
+                        Console.WriteLine($"[SKIP] File {relPath} is locked or unstable.");
+                        continue;
+                    }
+
+                    // Mark as pending to prevent concurrent processing
+                    _pendingOperations[relPath] = DateTime.UtcNow;
+
+                    // Compute file metadata
+                    var hash = ComputeFileHash(change.FilePath);
+                    var lastWrite = File.GetLastWriteTimeUtc(change.FilePath);
+                    var fileSize = new FileInfo(change.FilePath).Length;
+
+                    // Check for conflicts with existing file state
+                    if (_files.TryGetValue(relPath, out var existingMeta))
+                    {
+                        if (existingMeta.Hash == hash)
+                        {
+                            Console.WriteLine($"[SKIP] File {relPath} unchanged (same hash).");
+                            _pendingOperations.TryRemove(relPath, out _);
+                            continue;
+                        }
+
+                        // Conflict resolution: use last write time
+                        if (lastWrite <= existingMeta.LastWriteUtc.AddSeconds(1)) // 1 second tolerance
+                        {
+                            Console.WriteLine($"[SKIP] File {relPath} is older or same age as existing version.");
+                            _pendingOperations.TryRemove(relPath, out _);
+                            continue;
+                        }
+                    }
+
+                    var meta = new FileMeta
+                    {
+                        Hash = hash,
+                        LastWriteUtc = lastWrite,
+                        Size = fileSize,
+                        Version = Guid.NewGuid().ToString(),
+                        LastModifiedBy = GetLocalIPAddress()
+                    };
+
+                    _files[relPath] = meta;
+                    validChanges.Add((relPath, change.FilePath, meta));
+
+                    Console.WriteLine($"[BATCH] Prepared {relPath} for sync (Size: {fileSize}, Hash: {hash[..8]}...)");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[ERR ] ProcessBatchedChanges prep {change.FilePath}: {ex.Message}");
+                }
+            }
+
+            if (validChanges.Count == 0)
+                return;
+
+            // Second pass: sync files to peers with parallel processing
+            Console.WriteLine($"[BATCH] Syncing {validChanges.Count} files to peers");
+
+            var syncTasks = validChanges.Select(async change =>
+            {
+                try
+                {
+                    await SyncFileToPeers(change.relPath, change.fullPath);
+                    _recentlySynced[change.relPath] = DateTime.UtcNow;
+                    Console.WriteLine($"[BATCH] Synced {change.relPath}");
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[ERR ] Batch sync {change.relPath}: {ex.Message}");
+                }
+                finally
+                {
+                    _pendingOperations.TryRemove(change.relPath, out _);
+                }
+            });
+
+            await Task.WhenAll(syncTasks);
+        }
+
+        private async Task ProcessBatchedDeletions(List<PendingFileOperation> deletions)
+        {
+            if (deletions.Count == 0) return;
+
+            Console.WriteLine($"[BATCH] Processing {deletions.Count} file deletions");
+
+            var deletionTasks = deletions.Select(async deletion =>
+            {
+                try
+                {
+                    var relPath = GetRelativePath(deletion.FilePath);
+                    if (relPath == null || IsInTmpFolder(deletion.FilePath))
+                        return;
+
+                    _pendingOperations[relPath] = DateTime.UtcNow;
+
+                    _files.TryRemove(relPath, out _);
+                    Console.WriteLine($"[BATCH] Deleted {relPath}");
+
+                    await SyncDeleteToPeers(relPath);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[ERR ] ProcessBatchedDeletions {deletion.FilePath}: {ex.Message}");
+                }
+                finally
+                {
+                    var relPath = GetRelativePath(deletion.FilePath);
+                    if (relPath != null)
+                        _pendingOperations.TryRemove(relPath, out _);
+                }
+            });
+
+            await Task.WhenAll(deletionTasks);
+        }
+
+        private async Task ProcessBatchedRenames(List<PendingFileOperation> renames)
+        {
+            if (renames.Count == 0) return;
+
+            Console.WriteLine($"[BATCH] Processing {renames.Count} file renames");
+
+            var renameTasks = renames.Select(async rename =>
+            {
+                try
+                {
+                    if (IsInTmpFolder(rename.FilePath)) return;
+
+                    var oldRel = GetRelativePath(rename.OldPath);
+                    var newRel = GetRelativePath(rename.FilePath);
+                    if (oldRel == null || newRel == null) return;
+
+                    // Update file tracking
+                    if (_files.TryRemove(oldRel, out var meta) && File.Exists(rename.FilePath))
+                    {
+                        // Update metadata for new path
+                        var hash = ComputeFileHash(rename.FilePath);
+                        var lastWrite = File.GetLastWriteTimeUtc(rename.FilePath);
+                        var fileSize = new FileInfo(rename.FilePath).Length;
+
+                        _files[newRel] = new FileMeta
+                        {
+                            Hash = hash,
+                            LastWriteUtc = lastWrite,
+                            Size = fileSize,
+                            Version = Guid.NewGuid().ToString(),
+                            LastModifiedBy = GetLocalIPAddress()
+                        };
+                    }
+
+                    Console.WriteLine($"[BATCH] Renamed {oldRel} -> {newRel}");
+
+                    await SyncRenameToPeers(oldRel, newRel);
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"[ERR ] ProcessBatchedRenames {rename.FilePath}: {ex.Message}");
+                }
+            });
+
+            await Task.WhenAll(renameTasks);
+        }
+
+        // Enhanced file watcher with batching
+        private void StartFileWatcher()
+        {
+            _watcher = new FileSystemWatcher(_folder)
+            {
+                NotifyFilter = NotifyFilters.FileName | NotifyFilters.Size | NotifyFilters.LastWrite | NotifyFilters.CreationTime,
+                IncludeSubdirectories = true,
+                EnableRaisingEvents = true
+            };
+
+            _watcher.Created += (s, e) => ScheduleFileOperation(e.FullPath, "Created");
+            _watcher.Changed += (s, e) => ScheduleFileOperation(e.FullPath, "Changed");
+            _watcher.Deleted += (s, e) => ScheduleFileOperation(e.FullPath, "Deleted");
+            _watcher.Renamed += (s, e) => ScheduleRenameOperation(e.OldFullPath, e.FullPath);
+        }
+
+        private void ScheduleFileOperation(string path, string operationType)
+        {
+            if (IsInTmpFolder(path)) return;
+
+            var relPath = GetRelativePath(path);
+            if (relPath == null) return;
+
+            _lastFileActivity = DateTime.UtcNow;
+
+            var operation = new PendingFileOperation
+            {
+                FilePath = path,
+                OperationType = operationType,
+                LastActivity = DateTime.UtcNow,
+                IsProcessed = false
+            };
+
+            // Update or add the pending operation
+            _pendingFileOperations.AddOrUpdate(relPath, operation, (key, existing) =>
+            {
+                // If there's already a pending operation, update it with the latest activity
+                existing.LastActivity = DateTime.UtcNow;
+                existing.OperationType = operationType; // Latest operation takes precedence
+                existing.IsProcessed = false;
+                return existing;
+            });
+
+            Console.WriteLine($"[QUEUE] {operationType}: {relPath} (queued for batch processing)");
+        }
+
+        private void ScheduleRenameOperation(string oldPath, string newPath)
+        {
+            if (IsInTmpFolder(newPath)) return;
+
+            var oldRel = GetRelativePath(oldPath);
+            var newRel = GetRelativePath(newPath);
+            if (oldRel == null || newRel == null) return;
+
+            _lastFileActivity = DateTime.UtcNow;
+
+            // Remove any existing operations for both paths
+            _pendingFileOperations.TryRemove(oldRel, out _);
+            _pendingFileOperations.TryRemove(newRel, out _);
+
+            var operation = new PendingFileOperation
+            {
+                FilePath = newPath,
+                OldPath = oldPath,
+                OperationType = "Renamed",
+                LastActivity = DateTime.UtcNow,
+                IsProcessed = false
+            };
+
+            _pendingFileOperations[newRel] = operation;
+
+            Console.WriteLine($"[QUEUE] Renamed: {oldRel} -> {newRel} (queued for batch processing)");
+        }
+
+        // Thread-safe state file operations
+        private async Task SaveFileStatesAsync()
+        {
+            await _stateFileSemaphore.WaitAsync();
+            try
+            {
+                var dic = _files.ToDictionary(x => x.Key, x => x.Value);
+                var json = JsonSerializer.Serialize(dic, new JsonSerializerOptions { WriteIndented = true });
+
+                // Use a temporary file and atomic move to prevent corruption
+                var tempFile = _stateFile + ".tmp";
+                await File.WriteAllTextAsync(tempFile, json);
+
+                if (File.Exists(_stateFile))
+                    File.Delete(_stateFile);
+
+                File.Move(tempFile, _stateFile);
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"[ERR ] SaveFileStatesAsync: {ex.Message}");
+            }
+            finally
+            {
+                _stateFileSemaphore.Release();
             }
         }
 
@@ -609,89 +986,6 @@ namespace LanSync
             }
         }
 
-        private void StartFileWatcher()
-        {
-            _watcher = new FileSystemWatcher(_folder)
-            {
-                NotifyFilter = NotifyFilters.FileName | NotifyFilters.Size | NotifyFilters.LastWrite | NotifyFilters.CreationTime,
-                IncludeSubdirectories = true,
-                EnableRaisingEvents = true
-            };
-
-            _watcher.Created += (s, e) => ScheduleFileEvent(e.FullPath, "Created");
-            _watcher.Changed += (s, e) => ScheduleFileEvent(e.FullPath, "Changed");
-            _watcher.Deleted += (s, e) => ScheduleFileEvent(e.FullPath, "Deleted");
-            _watcher.Renamed += (s, e) => ScheduleRenameEvent(e.OldFullPath, e.FullPath);
-        }
-
-        private void ScheduleFileEvent(string path, string eventType)
-        {
-            if (IsInTmpFolder(path)) return;
-            var relPath = GetRelativePath(path);
-            if (relPath == null) return;
-
-            // Cancel existing pending operation for this file
-            if (_pendingFileEvents.TryRemove(relPath, out var existingCts))
-            {
-                existingCts.Cancel();
-                existingCts.Dispose();
-            }
-
-            // Schedule new operation with debouncing
-            var cts = new CancellationTokenSource();
-            _pendingFileEvents[relPath] = cts;
-
-            _ = Task.Run(async () =>
-            {
-                try
-                {
-                    await Task.Delay(FileEventDebounceMs, cts.Token);
-
-                    // Remove from pending operations
-                    _pendingFileEvents.TryRemove(relPath, out _);
-
-                    if (eventType == "Deleted")
-                        await OnFileDeleted(path);
-                    else
-                        await OnFileChanged(path, eventType);
-                }
-                catch (OperationCanceledException)
-                {
-                    // Event was debounced/cancelled
-                }
-                finally
-                {
-                    cts.Dispose();
-                }
-            });
-        }
-
-        private void ScheduleRenameEvent(string oldPath, string newPath)
-        {
-            if (IsInTmpFolder(newPath)) return;
-            var oldRel = GetRelativePath(oldPath);
-            var newRel = GetRelativePath(newPath);
-            if (oldRel == null || newRel == null) return;
-
-            // Cancel any pending operations for both paths
-            if (_pendingFileEvents.TryRemove(oldRel, out var oldCts))
-            {
-                oldCts.Cancel();
-                oldCts.Dispose();
-            }
-            if (_pendingFileEvents.TryRemove(newRel, out var newCts))
-            {
-                newCts.Cancel();
-                newCts.Dispose();
-            }
-
-            _ = Task.Run(async () =>
-            {
-                await Task.Delay(FileEventDebounceMs / 2); // Shorter delay for renames
-                await OnFileRenamed(oldPath, newPath);
-            });
-        }
-
         // Enhanced suppression cleanup with better logic
         private async Task SuppressionCleanupTask(CancellationToken cancellationToken)
         {
@@ -722,143 +1016,6 @@ namespace LanSync
             }
             foreach (var key in keysToRemove)
                 dict.TryRemove(key, out _);
-        }
-
-        // Enhanced file change handling with better conflict detection
-        private async Task OnFileChanged(string path, string reason)
-        {
-            if (IsInTmpFolder(path)) return;
-            var relPath = GetRelativePath(path);
-            if (relPath == null) return;
-
-            // Enhanced suppression check with atomic operations
-            if (IsRecentlyProcessed(relPath))
-            {
-                Console.WriteLine($"[SKIP] Not syncing {relPath} (recently processed).");
-                return;
-            }
-
-            if (!File.Exists(path)) return;
-
-            // Wait for file to stabilize and check if it's locked
-            if (!await WaitForFileStability(path))
-            {
-                Console.WriteLine($"[SKIP] File {relPath} is locked or unstable.");
-                return;
-            }
-
-            try
-            {
-                // Mark as pending to prevent concurrent processing
-                _pendingOperations[relPath] = DateTime.UtcNow;
-
-                // Compute file metadata
-                var hash = ComputeFileHash(path);
-                var lastWrite = File.GetLastWriteTimeUtc(path);
-                var fileSize = new FileInfo(path).Length;
-
-                // Check for conflicts with existing file state
-                if (_files.TryGetValue(relPath, out var existingMeta))
-                {
-                    if (existingMeta.Hash == hash)
-                    {
-                        Console.WriteLine($"[SKIP] File {relPath} unchanged (same hash).");
-                        return;
-                    }
-
-                    // Conflict resolution: use last write time
-                    if (lastWrite <= existingMeta.LastWriteUtc.AddSeconds(1)) // 1 second tolerance
-                    {
-                        Console.WriteLine($"[SKIP] File {relPath} is older or same age as existing version.");
-                        return;
-                    }
-                }
-
-                // Update file metadata
-                _files[relPath] = new FileMeta
-                {
-                    Hash = hash,
-                    LastWriteUtc = lastWrite,
-                    Size = fileSize,
-                    Version = Guid.NewGuid().ToString(),
-                    LastModifiedBy = GetLocalIPAddress()
-                };
-                await SaveFileStatesAsync();
-
-                Console.WriteLine($"[EVENT] File {reason}: {relPath} (Size: {fileSize}, Hash: {hash[..8]}...)");
-
-                // Sync to all peers with retry logic
-                await SyncFileToPeers(relPath, path);
-
-                _recentlySynced[relPath] = DateTime.UtcNow;
-            }
-            finally
-            {
-                _pendingOperations.TryRemove(relPath, out _);
-            }
-        }
-
-        private async Task OnFileDeleted(string path)
-        {
-            if (IsInTmpFolder(path)) return;
-            var relPath = GetRelativePath(path);
-            if (relPath == null) return;
-
-            // Mark as pending
-            _pendingOperations[relPath] = DateTime.UtcNow;
-
-            try
-            {
-                _files.TryRemove(relPath, out _);
-                await SaveFileStatesAsync();
-
-                Console.WriteLine($"[EVENT] File Deleted: {relPath}");
-
-                await SyncDeleteToPeers(relPath);
-            }
-            finally
-            {
-                _pendingOperations.TryRemove(relPath, out _);
-            }
-        }
-
-        private async Task OnFileRenamed(string oldPath, string newPath)
-        {
-            if (IsInTmpFolder(newPath)) return;
-            var oldRel = GetRelativePath(oldPath);
-            var newRel = GetRelativePath(newPath);
-            if (oldRel == null || newRel == null) return;
-
-            try
-            {
-                // Update file tracking
-                if (_files.TryRemove(oldRel, out var meta) && File.Exists(newPath))
-                {
-                    // Update metadata for new path
-                    var hash = ComputeFileHash(newPath);
-                    var lastWrite = File.GetLastWriteTimeUtc(newPath);
-                    var fileSize = new FileInfo(newPath).Length;
-
-                    _files[newRel] = new FileMeta
-                    {
-                        Hash = hash,
-                        LastWriteUtc = lastWrite,
-                        Size = fileSize,
-                        Version = Guid.NewGuid().ToString(),
-                        LastModifiedBy = GetLocalIPAddress()
-                    };
-                }
-
-                await SaveFileStatesAsync();
-
-                Console.WriteLine($"[EVENT] File Renamed: {oldRel} -> {newRel}");
-
-                await SyncRenameToPeers(oldRel, newRel);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[ERR ] OnFileRenamed: {ex.Message}");
-            }
         }
 
         // Enhanced peer synchronization with retry logic
@@ -1458,20 +1615,6 @@ namespace LanSync
             }
         }
 
-        private async Task SaveFileStatesAsync()
-        {
-            try
-            {
-                var dic = _files.ToDictionary(x => x.Key, x => x.Value);
-                var json = JsonSerializer.Serialize(dic, new JsonSerializerOptions { WriteIndented = true });
-                await File.WriteAllTextAsync(_stateFile, json);
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"[ERR ] SaveFileStatesAsync: {ex.Message}");
-            }
-        }
-
         private async Task Shutdown()
         {
             try
@@ -1481,13 +1624,11 @@ namespace LanSync
                 // Cancel all pending operations
                 _shutdownToken.Cancel();
 
-                // Cancel all pending file events
-                foreach (var cts in _pendingFileEvents.Values)
-                {
-                    cts.Cancel();
-                    cts.Dispose();
-                }
-                _pendingFileEvents.Clear();
+                // Stop the timer
+                _batchProcessingTimer?.Dispose();
+
+                // Process any remaining pending operations
+                await ProcessPendingBatch(null);
 
                 // Save final state
                 await SaveFileStatesAsync();
@@ -1503,6 +1644,8 @@ namespace LanSync
                     semaphore.Dispose();
 
                 _fullSyncSemaphore?.Dispose();
+                _stateFileSemaphore?.Dispose();
+                _batchProcessingSemaphore?.Dispose();
                 _shutdownToken.Dispose();
 
                 Console.WriteLine("[INFO] Shutdown complete.");
